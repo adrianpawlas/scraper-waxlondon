@@ -1,0 +1,10 @@
+requests
+beautifulsoup4
+supabase
+transformers
+torch
+pillow
+python-dotenv
+aiohttp
+asyncio
+certifi
