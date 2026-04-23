@@ -9,3 +9,4 @@ aiohttp
 asyncio
 certifi
 sentencepiece
+protobuf
