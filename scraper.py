@@ -10,6 +10,7 @@ from urllib.parse import urljoin
 
 import aiohttp
 import requests
+import torch
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from supabase import create_client, Client
