@@ -333,8 +333,8 @@ def scrape_product(html: str, product_url: str, category_name: str) -> dict:
         "url": product_url,
     })
     
-    if product_data["category"] == "All Clothing" or not product_data["category"]:
-        product_data["category"] = category_name
+    if category_name == "All" and not product_data["category"]:
+        product_data["category"] = "All Clothing"
     
     return product_data
 
@@ -400,8 +400,18 @@ def get_image_embedding(image_url: str, model, processor, device) -> list[float]
 
 def upload_to_supabase(products: list[dict], supabase: Client) -> int:
     uploaded = 0
+    errors = 0
+    seen_ids = set()
+    
     for product in products:
         try:
+            product_id = product["id"]
+            
+            if product_id in seen_ids:
+                logger.info(f"Skipping duplicate: {product['title']}")
+                continue
+            seen_ids.add(product_id)
+            
             data = {
                 "id": product["id"],
                 "source": product["source"],
@@ -424,10 +434,12 @@ def upload_to_supabase(products: list[dict], supabase: Client) -> int:
             
             supabase.table("products").upsert(data, on_conflict="id").execute()
             uploaded += 1
-            logger.info(f"Uploaded: {product['title']}")
+            logger.info(f"Uploaded {uploaded}: {product['title'][:50]}...")
         except Exception as e:
+            errors += 1
             logger.info(f"Error uploading {product.get('title', 'unknown')}: {e}")
     
+    logger.info(f"Upload complete: {uploaded} uploaded, {errors} errors")
     return uploaded
 
 
@@ -460,11 +472,19 @@ async def main():
         
         logger.info(f"\nTotal products to scrape: {sum(len(v) for v in all_product_urls.values())}")
         
+        all_urls_flat = []
+        seen_urls = set()
+        for urls in all_product_urls.values():
+            for url in urls:
+                if url not in seen_urls:
+                    seen_urls.add(url)
+                    all_urls_flat.append(url)
+        
+        logger.info(f"Unique products: {len(all_urls_flat)}")
+        
         all_products = []
-        for category_name, urls in all_product_urls.items():
-            if urls:
-                products = await scrape_products_batch(session, urls, category_name)
-                all_products.extend(products)
+        products = await scrape_products_batch(session, all_urls_flat, "All")
+        all_products.extend(products)
         
         logger.info(f"\nScraped {len(all_products)} products")
         
