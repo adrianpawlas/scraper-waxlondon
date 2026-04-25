@@ -361,7 +361,8 @@ def get_text_embedding(text: str, model, processor, device) -> list[float]:
         return [0.0] * 768
     
     try:
-        inputs = processor(text=text, return_tensors="pt").to(device)
+        truncated = text[:500]
+        inputs = processor(text=truncated, return_tensors="pt").to(device)
         with torch.no_grad():
             outputs = model.get_text_features(**inputs)
         if hasattr(outputs, 'pooler_output'):
