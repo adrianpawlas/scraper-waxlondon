@@ -399,49 +399,159 @@ def get_image_embedding(image_url: str, model, processor, device) -> list[float]
         return [0.0] * 768
 
 
-def upload_to_supabase(products: list[dict], supabase: Client) -> int:
-    uploaded = 0
+async def get_existing_products(supabase: Client, source: str) -> dict:
+    seen_map = {}
+    try:
+        response = supabase.table("products").select("*").eq("source", source).execute()
+        for product in response.data:
+            seen_map[product["product_url"]] = product
+    except Exception as e:
+        logger.info(f"Error fetching existing products: {e}")
+    return seen_map
+
+
+def check_product_changed(existing: dict, new_data: dict) -> bool:
+    if not existing:
+        return True
+    
+    fields_to_check = ["title", "description", "price", "sale", "image_url", "additional_images", "category"]
+    for field in fields_to_check:
+        if existing.get(field) != new_data.get(field):
+            return True
+    return False
+
+
+def prepare_product_data(product: dict, existing: dict = None, regenerate_embeddings: bool = False) -> dict:
+    data = {
+        "id": product["id"],
+        "source": product["source"],
+        "product_url": product["product_url"],
+        "brand": product["brand"],
+        "title": product["title"],
+        "description": product["description"],
+        "category": product["category"],
+        "gender": product["gender"],
+        "second_hand": product["second_hand"],
+        "price": product["price"],
+        "sale": product["sale"],
+        "image_url": product["image_url"],
+        "additional_images": product["additional_images"],
+        "metadata": product["metadata"],
+        "created_at": product["created_at"],
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+    
+    if regenerate_embeddings or not existing:
+        data["image_embedding"] = product.get("image_embedding")
+        data["info_embedding"] = product.get("info_embedding")
+    else:
+        data["image_embedding"] = existing.get("image_embedding")
+        data["info_embedding"] = existing.get("info_embedding")
+    
+    return data
+
+
+def upload_batch(supabase: Client, products: list[dict], source: str) -> tuple[int, int]:
+    if not products:
+        return 0, 0
+    
+    success = 0
     errors = 0
-    seen_ids = set()
+    
+    for attempt in range(3):
+        try:
+            data = [{"source": source, "product_url": p["product_url"], "title": p.get("title", ""), 
+                    "price": p.get("price", ""), "image_url": p.get("image_url", ""),
+                    "updated_at": datetime.utcnow().isoformat()} for p in products]
+            supabase.table("products").upsert(data, on_conflict="source,product_url").execute()
+            success = len(products)
+            break
+        except Exception as e:
+            if attempt == 2:
+                logger.info(f"Batch insert failed: {e}")
+                for p in products:
+                    logger.info(f"  Failed: {p.get('title', 'unknown')}")
+                errors = len(products)
+            import time
+            time.sleep(1)
+    
+    return success, errors
+
+
+async def smart_upload_products(supabase: Client, products: list[dict], existing_products: dict, source: str, model, processor, device) -> dict:
+    new_count = 0
+    updated_count = 0
+    unchanged_count = 0
+    
+    new_products = []
+    products_to_update = []
+    urls_seen = set()
     
     for product in products:
-        try:
-            product_id = product["id"]
-            
-            if product_id in seen_ids:
-                logger.info(f"Skipping duplicate: {product['title']}")
-                continue
-            seen_ids.add(product_id)
-            
-            data = {
-                "id": product["id"],
-                "source": product["source"],
-                "product_url": product["product_url"],
-                "brand": product["brand"],
-                "title": product["title"],
-                "description": product["description"],
-                "category": product["category"],
-                "gender": product["gender"],
-                "second_hand": product["second_hand"],
-                "price": product["price"],
-                "sale": product["sale"],
-                "image_url": product["image_url"],
-                "additional_images": product["additional_images"],
-                "metadata": product["metadata"],
-                "created_at": product["created_at"],
-                "image_embedding": product.get("image_embedding"),
-                "info_embedding": product.get("info_embedding"),
-            }
-            
-            supabase.table("products").upsert(data, on_conflict="id").execute()
-            uploaded += 1
-            logger.info(f"Uploaded {uploaded}: {product['title'][:50]}...")
-        except Exception as e:
-            errors += 1
-            logger.info(f"Error uploading {product.get('title', 'unknown')}: {e}")
+        url = product["product_url"]
+        urls_seen.add(url)
+        
+        existing = existing_products.get(url)
+        has_changed = check_product_changed(existing, product)
+        image_changed = existing and existing.get("image_url") != product.get("image_url")
+        
+        if not existing:
+            new_count += 1
+            new_products.append(product)
+        elif has_changed:
+            updated_count += 1
+            product["needs_embedding"] = image_changed
+            products_to_update.append(product)
+        else:
+            unchanged_count += 1
     
-    logger.info(f"Upload complete: {uploaded} uploaded, {errors} errors")
-    return uploaded
+    logger.info(f"Products: {new_count} new, {updated_count} changed, {unchanged_count} unchanged")
+    
+    all_products_to_insert = new_products + products_to_update
+    
+    logger.info("\nGenerating embeddings for new/changed products...")
+    emb_count = 0
+    for i, product in enumerate(all_products_to_insert):
+        if product.get("needs_embedding") or not existing_products.get(product["product_url"]):
+            img_url = product.get("image_url", "")
+            if img_url:
+                product["image_embedding"] = get_image_embedding(img_url, model, processor, device)
+            
+            info_text = f"{product['title']} {product['description']} {product['category']} {product['gender']} {product['price']}"[:500]
+            product["info_embedding"] = get_text_embedding(info_text, model, processor, device)
+            emb_count += 1
+            logger.info(f"Embedding {emb_count}/{len(all_products_to_insert)}: {product['title'][:40]}...")
+            import time
+            time.sleep(0.5)
+    
+    existing_urls = set(existing_products.keys())
+    stale_urls = existing_urls - urls_seen
+    
+    if stale_urls:
+        logger.info(f"Found {len(stale_urls)} potentially stale products")
+    
+    batch_data = []
+    for product in all_products_to_insert:
+        existing = existing_products.get(product["product_url"])
+        regenerate = existing and existing.get("image_url") != product.get("image_url")
+        data = prepare_product_data(product, existing, regenerate)
+        batch_data.append(data)
+        
+        if len(batch_data) >= 50:
+            succ, errs = upload_batch(supabase, batch_data, source)
+            batch_data = []
+            import time
+            time.sleep(0.5)
+    
+    if batch_data:
+        succ, errs = upload_batch(supabase, batch_data, source)
+    
+    return {
+        "new": new_count,
+        "updated": updated_count,
+        "unchanged": unchanged_count,
+        "stale": len(stale_urls),
+    }
 
 
 async def main():
@@ -460,7 +570,12 @@ async def main():
     
     logger.info(f"Model loaded on {device}")
     
+    source = "scraper-waxlondon"
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    
+    logger.info("Fetching existing products...")
+    existing_products = await get_existing_products(supabase, source)
+    logger.info(f"Found {len(existing_products)} existing products in database")
     
     async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ssl_context)) as session:
         all_product_urls = {}
@@ -489,20 +604,18 @@ async def main():
         
         logger.info(f"\nScraped {len(all_products)} products")
         
-        logger.info("\nGenerating embeddings...")
-        for i, product in enumerate(all_products):
-            logger.info(f"Processing embedding {i+1}/{len(all_products)}: {product['title'][:50]}...")
-            
-            image_url = product.get("image_url", "")
-            if image_url:
-                product["image_embedding"] = get_image_embedding(image_url, model, processor, device)
-            
-            info_text = f"{product['title']} {product['description']} {product['category']} {product['gender']} {product['price']}"
-            product["info_embedding"] = get_text_embedding(info_text, model, processor, device)
+        logger.info("\nSmart uploading to Supabase...")
+        stats = await smart_upload_products(supabase, all_products, existing_products, source, model, processor, device)
         
-        logger.info("\nUploading to Supabase...")
-        uploaded = upload_to_supabase(all_products, supabase)
-        logger.info(f"\nSuccessfully uploaded {uploaded} products to Supabase")
+        logger.info("\n" + "="*50)
+        logger.info("SCRAPER SUMMARY")
+        logger.info("="*50)
+        logger.info(f"X products added: {stats['new']}")
+        logger.info(f"X products updated: {stats['updated']}")
+        logger.info(f"X products unchanged: {stats['unchanged']}")
+        logger.info(f"X stale products: {stats['stale']}")
+        logger.info("="*50)
+        logger.info(f"\nScraper finished successfully!")
 
 
 if __name__ == "__main__":
